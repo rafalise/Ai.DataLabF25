@@ -13,12 +13,9 @@ NP_FILE       = ROOT / "data_work" / "np_geocoded.csv"
 PHYS_FILE     = ROOT / "data_work" / "phys_geocoded.csv"
 DEM_FILE      = ROOT / "data_work" / "demographics.csv"          # optional (percents)
 TOTPOP_FALLB  = ROOT / "data_raw" / "censuscountiesclean.csv"    # fallback for pop + percents
-CTYTYPE_FILE  = ROOT / "data_work" / "county_type_by_fips.csv"   # optional (type + maybe income)
+CTYTYPE_FILE  = ROOT / "data_work" / "county_type_by_fips.csv"   # optional (rural/suburban/urban)
+INCOME_FILE   = ROOT / "data_work" / "income_by_fips.csv"        # median household income (cleaned)
 
-# >>> ADDED: optional fallback income file
-INCOME_FILE   = ROOT / "data_work" / "income_by_fips.csv"        # optional fallback income
-
-# ---------- helpers ----------
 def load_ga_geojson():
     url = "https://raw.githubusercontent.com/plotly/datasets/master/geojson-counties-fips.json"
     geo = requests.get(url, timeout=30).json()
@@ -33,8 +30,7 @@ def load_points(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path, dtype=str)
     df = df[df["status"].isin(["matched", "zip_fallback"])].copy()
     df["county_fips"] = df["county_fips"].str.zfill(5)
-    return (df.groupby("county_fips", as_index=False)
-              .size().rename(columns={"size":"count"}))
+    return (df.groupby("county_fips", as_index=False).size().rename(columns={"size":"count"}))
 
 def safe_ratio(numer, denom):
     x = pd.to_numeric(numer, errors="coerce")
@@ -49,7 +45,6 @@ def robust_range(s: pd.Series):
     if not np.isfinite(hi) or hi<=lo: hi = lo+1.0
     return (max(0.0, lo), hi)
 
-# ---------- build master ----------
 geo, names = load_ga_geojson()
 
 np_counts   = load_points(NP_FILE).rename(columns={"count":"np_count"})
@@ -61,7 +56,7 @@ tbl["np_count"]  = tbl["np_count"].fillna(0).astype(int)
 tbl["doc_count"] = tbl["doc_count"].fillna(0).astype(int)
 tbl["doc_np_ratio"] = safe_ratio(tbl["doc_count"], tbl["np_count"])
 
-# ---- demographics (prefer data_work/demographics.csv, else fall back to censuscountiesclean.csv) ----
+# demographics
 if DEM_FILE.exists():
     demo = pd.read_csv(DEM_FILE, dtype=str)
     demo["county_fips"] = demo["county_fips"].str.zfill(5)
@@ -72,11 +67,8 @@ if DEM_FILE.exists():
         on="county_fips", how="left"
     )
 else:
-    # fallback: your earlier CSV with GA-only rows and percent columns
     if TOTPOP_FALLB.exists():
         cc = pd.read_csv(TOTPOP_FALLB, dtype=str)
-        # expected columns in your file:
-        # FIPS, TOT_POP, WA_TOTAL, BA_TOTAL, IA_TOTAL, AA_TOTAL, NA_TOTAL, TOM_TOTAL, H_TOTAL
         rename_map = {
             "FIPS":"county_fips",
             "TOT_POP":"tot_pop",
@@ -97,43 +89,36 @@ else:
         cc = cc[cc["county_fips"].str.startswith("13")]
         tbl = tbl.merge(cc, on="county_fips", how="left")
 
-# NP density per 10k when tot_pop present
+# density
 if "tot_pop" in tbl.columns:
     tot = pd.to_numeric(tbl["tot_pop"], errors="coerce")
     tbl["np_density_10k"] = np.where((tot>0)&np.isfinite(tot), tbl["np_count"]/tot*10000.0, np.nan)
 else:
     tbl["np_density_10k"] = np.nan
 
-# ---- county type + (optional) income from county_type_by_fips.csv ----
+# county type / income
 if CTYTYPE_FILE.exists():
     ct = pd.read_csv(CTYTYPE_FILE, dtype=str)
     ct["county_fips"] = ct["county_fips"].str.zfill(5)
-    if "median_income" in ct.columns:
-        ct["median_income"] = pd.to_numeric(ct["median_income"], errors="coerce")
     cols = ["county_fips"]
     if "county_type" in ct.columns: cols.append("county_type")
-    if "median_income" in ct.columns: cols.append("median_income")
     ct = ct[cols].drop_duplicates("county_fips")
     tbl = tbl.merge(ct, on="county_fips", how="left")
 else:
-    tbl["county_type"]  = "Unknown"
-    tbl["median_income"] = np.nan
+    tbl["county_type"] = "Unknown"
 
-# >>> ADDED: fallback income merge (data_work/income_by_fips.csv)
 if INCOME_FILE.exists():
     inc = pd.read_csv(INCOME_FILE, dtype=str)
-    if {"county_fips","median_income"}.issubset(inc.columns):
-        inc["county_fips"] = inc["county_fips"].astype(str).str.zfill(5)
+    inc["county_fips"] = inc["county_fips"].str.zfill(5)
+    if "median_income" in inc.columns:
         inc["median_income"] = pd.to_numeric(inc["median_income"], errors="coerce")
-        tbl = tbl.merge(inc[["county_fips","median_income"]], on="county_fips", how="left", suffixes=("", "_inc"))
-        if "median_income_inc" in tbl.columns:
-            tbl["median_income"] = tbl["median_income"].combine_first(tbl["median_income_inc"])
-            tbl = tbl.drop(columns=["median_income_inc"])
+        tbl = tbl.merge(inc[["county_fips","median_income"]], on="county_fips", how="left")
+else:
+    tbl["median_income"] = np.nan
 
-# default county_type
 tbl["county_type"] = tbl["county_type"].fillna("Unknown")
 
-# hover (name, NPs, ratio, type)
+# hover text
 ratio_txt = pd.Series(tbl["doc_np_ratio"]).round(2).astype(str)
 tbl["hover_text"] = (
     tbl["county_name"] + "<br>"
@@ -142,7 +127,6 @@ tbl["hover_text"] = (
     + "Type: " + tbl["county_type"]
 )
 
-# metric choices
 metric_options = [{"label":"NP count","value":"np_count"}]
 if tbl["np_density_10k"].notna().any():
     metric_options.append({"label":"NP density (per 10k)","value":"np_density_10k"})
@@ -150,7 +134,6 @@ metric_options.append({"label":"Doctor:NP ratio","value":"doc_np_ratio"})
 
 DEFAULT_FIPS = tbl["county_fips"].iloc[0]
 
-# ---------- figures ----------
 def make_map(df: pd.DataFrame, geojson, metric: str, outlines: bool) -> go.Figure:
     plot = df.copy()
     if metric not in plot.columns: plot[metric] = 0
@@ -175,86 +158,112 @@ def make_map(df: pd.DataFrame, geojson, metric: str, outlines: bool) -> go.Figur
     return fig
 
 def make_pie(row: pd.Series) -> go.Figure | None:
-    # works if we have *_pct columns from DEM_FILE or fallback
     needed = ["white_pct","black_pct","asian_pct","aian_pct","nhpi_pct","two_plus_pct","hispanic_pct"]
-    if all(k in row.index for k in needed) and pd.notna(row["white_pct"]):
-        labels = ["White","Black","Asian","AIAN","NHPI","Two+","Hispanic"]
-        vals = [float(row.get(k,0) or 0) for k in needed]
-        fig = go.Figure(data=[go.Pie(labels=labels, values=vals, hole=0.35)])
-        fig.update_layout(margin=dict(l=0,r=0,t=0,b=0), height=320, legend=dict(orientation="h"))
-        return fig
-    return None
+    if not all(k in row.index for k in needed) or pd.isna(row.get("white_pct", np.nan)):
+        return None
+    labels = ["White","Black","Asian","AIAN","NHPI","Two+","Hispanic"]
+    vals   = [float(row.get(k, 0) or 0) for k in needed]
+    fig = go.Figure(data=[go.Pie(
+        labels=labels, values=vals, hole=0.35, sort=False, direction="clockwise",
+        textinfo="percent", texttemplate="%{value:.1f}%", hovertemplate="%{label}: %{value:.2f}%",
+        marker=dict(line=dict(color="rgba(255,255,255,0.9)", width=1)),
+        domain=dict(x=[0.0, 1.0], y=[0.15, 0.95])
+    )])
+    fig.update_layout(
+        autosize=False, width=420, height=360,
+        margin=dict(l=10, r=10, t=10, b=120),
+        showlegend=True,
+        legend=dict(orientation="h", y=-0.35, x=0.5, xanchor="center"),
+        uniformtext_minsize=10, uniformtext_mode="hide",
+    )
+    return fig
 
-# ---------- Dash app ----------
 app = Dash(__name__)
 app.title = "Georgia NP Dashboard"
-server = app.server
+
+TITLE_BY_METRIC = {
+    "np_count":       "NP Workforce by County (Count)",
+    "np_density_10k": "NP Workforce by County (per 10k)",
+    "doc_np_ratio":   "Doctor:NP Ratio by County",
+}
 
 app.layout = html.Div(
     style={"padding":"16px","fontFamily":"Inter, system-ui, -apple-system, Segoe UI, Roboto, sans-serif"},
     children=[
-        html.H1("Georgia Nurse Practitioners — Single Map", style={"margin":"0 0 12px 0"}),
+        html.H1("Georgia Nurse Practitioners — County View", style={"margin":"0 0 12px 0"}),
+
+        # Color by row (removed &nbsp)
+        html.Div([
+            html.Strong("Color by:"),
+            dcc.RadioItems(id="metric", options=metric_options,
+                           value=metric_options[0]["value"], inline=True,
+                           style={"marginLeft":"8px"}),
+        ], style={"marginBottom":"6px"}),
+
+        # New combined row: label + dropdown + (map title link) — dropdown sits BETWEEN them
+        html.Div([
+            html.Strong("County type filter:"),
+            dcc.Dropdown(
+                id="type_filter",
+                options=[{"label":"All","value":"All"}] +
+                        [{"label":t,"value":t} for t in sorted(tbl["county_type"].dropna().unique())],
+                value="All", clearable=False,
+                style={"width":"240px","margin":"0 12px"}
+            ),
+            html.A("NP Workforce by County (Count)", id="map_title", href="#",
+                   style={"fontWeight":"600","color":"#1f77b4"})
+        ], style={"display":"flex","alignItems":"center","marginBottom":"8px"}),
 
         html.Div([
-            html.Div([
-                html.Label("Color by:", style={"fontWeight":"600"}),
-                dcc.RadioItems(id="metric", options=metric_options,
-                               value=metric_options[0]["value"], inline=True),
-                html.Div(style={"height":"6px"}),
-                html.Label("County type filter:", style={"fontWeight":"600"}),
-                dcc.Dropdown(
-                    id="type_filter",
-                    options=[{"label":"All","value":"All"}] +
-                            [{"label":t,"value":t} for t in sorted(tbl["county_type"].dropna().unique())],
-                    value="All", clearable=False, style={"width":"240px"}
-                ),
-                dcc.Checklist(id="outlines", options=[{"label":" Show county outlines","value":"on"}],
-                              value=["on"], style={"marginTop":"6px"}),
-                dcc.Graph(id="ga_map", style={"height":"600px","width":"100%"})
-            ], style={"flex":"2","minWidth":"540px","paddingRight":"18px"}),
+            html.Div([ dcc.Graph(id="ga_map", style={"height":"600px","width":"100%"}) ],
+                     style={"flex":"2","minWidth":"540px","paddingRight":"18px"}),
 
             html.Div([
                 html.H3(id="detail_title"),
-                html.Div([
-                    html.Div([html.Div("NPs", style={"fontSize":"12px","color":"#999"}),
-                              html.Div(id="d_np", style={"fontSize":"28px"})], style={"flex":"1"}),
-                    html.Div([html.Div("Doctors", style={"fontSize":"12px","color":"#999"}),
-                              html.Div(id="d_doc", style={"fontSize":"28px"})], style={"flex":"1"}),
-                    html.Div([html.Div("Doctor:NP", style={"fontSize":"12px","color":"#999"}),
-                              html.Div(id="d_ratio", style={"fontSize":"28px"})], style={"flex":"1"}),
-                ], style={"display":"flex","gap":"16px","marginBottom":"8px"}),
 
                 html.Div([
-                    html.Div([html.Div("NP density (per 10k)", style={"fontSize":"12px","color":"#999"}),
-                              html.Div(id="d_density")], style={"flex":"1"}),
-                    html.Div([html.Div("Median household income", style={"fontSize":"12px","color":"#999"}),
-                              html.Div(id="d_income")], style={"flex":"1"}),
-                ], style={"display":"flex","gap":"16px","marginBottom":"8px"}),
+                    html.Div([html.Div("NPs", style={"fontSize":"12px","color":"#666"}),
+                              html.Div(id="d_np", style={"fontSize":"28px","fontWeight":"600"})]),
+                    html.Div([html.Div("Doctors", style={"fontSize":"12px","color":"#666"}),
+                              html.Div(id="d_doc", style={"fontSize":"28px","fontWeight":"600"})]),
+                    html.Div([html.Div("Doctor:NP", style={"fontSize":"12px","color":"#666"}),
+                              html.Div(id="d_ratio", style={"fontSize":"28px","fontWeight":"600"})]),
+                ], style={"display":"grid","gridTemplateColumns":"repeat(3,1fr)","columnGap":"16px","rowGap":"8px","marginBottom":"10px"}),
 
-                html.Div([html.Div("County type", style={"fontSize":"12px","color":"#999"}),
+                html.Div([
+                    html.Div([html.Div("NP density (per 10k)", style={"fontSize":"12px","color":"#666"}),
+                              html.Div(id="d_density")]),
+                    html.Div([html.Div("Median household income", style={"fontSize":"12px","color":"#666"}),
+                              html.Div(id="d_income")]),
+                ], style={"display":"grid","gridTemplateColumns":"repeat(2,1fr)","columnGap":"16px","rowGap":"8px","marginBottom":"10px"}),
+
+                html.Div([html.Div("County type", style={"fontSize":"12px","color":"#666"}),
                           html.Div(id="d_type")], style={"marginBottom":"12px"}),
 
-                html.H4("Racial / Ethnic Composition (%)"),
-                dcc.Graph(id="pie", style={"height":"320px"}),
-            ], style={"flex":"1","minWidth":"360px"})
+                html.H4("Racial / Ethnic Composition (%)", style={"margin":"8px 0 4px 0"}),
+                dcc.Graph(id="pie", style={"height":"380px","width":"440px"},
+                          config={"displayModeBar": False, "responsive": False}),
+            ], style={"flex":"1","minWidth":"380px"})
         ], style={"display":"flex","gap":"12px"}),
 
         dcc.Store(id="selected_fips", data=DEFAULT_FIPS),
     ]
 )
 
-# --- callbacks ---
 @app.callback(
     Output("ga_map","figure"),
     Input("metric","value"),
     Input("type_filter","value"),
-    Input("outlines","value"),
 )
-def update_map(metric, type_filter, outlines):
+def update_map(metric, type_filter):
     df = tbl.copy()
     if type_filter and type_filter!="All":
         df = df[df["county_type"].fillna("Unknown")==type_filter]
-    return make_map(df, geo, metric, outlines and ("on" in outlines))
+    return make_map(df, geo, metric, outlines=True)
+
+@app.callback(Output("map_title", "children"), Input("metric", "value"))
+def update_map_title(metric):
+    return TITLE_BY_METRIC.get(metric, "NP Workforce by County (Count)")
 
 @app.callback(
     Output("selected_fips","data"),
@@ -290,8 +299,10 @@ def update_details(fips):
     d_type  = str(row.get("county_type","Unknown"))
 
     pie_fig = make_pie(row) or go.Figure(layout=dict(
-        annotations=[dict(text="No demographics available", x=0.5, y=0.5, showarrow=False)],
-        margin=dict(l=0,r=0,t=0,b=0), height=320
+        annotations=[dict(text="No demographics available", x=0.5, y=0.55, showarrow=False)],
+        autosize=False, width=420, height=360,
+        margin=dict(l=10,r=10,t=10,b=120),
+        legend=dict(orientation="h", y=-0.35, x=0.5, xanchor="center")
     ))
     return title, d_np, d_doc, d_ratio, d_dens, d_inc, d_type, pie_fig
 
