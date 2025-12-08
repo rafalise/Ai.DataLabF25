@@ -15,6 +15,9 @@ DEM_FILE      = ROOT / "data_work" / "demographics.csv"          # optional (per
 TOTPOP_FALLB  = ROOT / "data_raw" / "censuscountiesclean.csv"    # fallback for pop + percents
 CTYTYPE_FILE  = ROOT / "data_work" / "county_type_by_fips.csv"   # optional (type + maybe income)
 
+# >>> ADDED: optional fallback income file
+INCOME_FILE   = ROOT / "data_work" / "income_by_fips.csv"        # optional fallback income
+
 # ---------- helpers ----------
 def load_ga_geojson():
     url = "https://raw.githubusercontent.com/plotly/datasets/master/geojson-counties-fips.json"
@@ -46,17 +49,6 @@ def robust_range(s: pd.Series):
     if not np.isfinite(hi) or hi<=lo: hi = lo+1.0
     return (max(0.0, lo), hi)
 
-def metric_title(metric: str, type_filter: str | None) -> str:
-    base = {
-        "np_count": "NP count by county",
-        "np_density_10k": "NP density per 10,000 residents",
-        "doc_np_ratio": "Doctor-to-NP ratio (higher = more physicians per NP)",
-    }
-    t = base.get(metric, metric)
-    if type_filter and type_filter != "All":
-        t += f" — {type_filter} counties"
-    return t
-
 # ---------- build master ----------
 geo, names = load_ga_geojson()
 
@@ -80,10 +72,10 @@ if DEM_FILE.exists():
         on="county_fips", how="left"
     )
 else:
-    # fallback: GA-only rows and percent columns
+    # fallback: your earlier CSV with GA-only rows and percent columns
     if TOTPOP_FALLB.exists():
         cc = pd.read_csv(TOTPOP_FALLB, dtype=str)
-        # expected columns:
+        # expected columns in your file:
         # FIPS, TOT_POP, WA_TOTAL, BA_TOTAL, IA_TOTAL, AA_TOTAL, NA_TOTAL, TOM_TOTAL, H_TOTAL
         rename_map = {
             "FIPS":"county_fips",
@@ -112,7 +104,7 @@ if "tot_pop" in tbl.columns:
 else:
     tbl["np_density_10k"] = np.nan
 
-# ---- county type + (optional) income ----
+# ---- county type + (optional) income from county_type_by_fips.csv ----
 if CTYTYPE_FILE.exists():
     ct = pd.read_csv(CTYTYPE_FILE, dtype=str)
     ct["county_fips"] = ct["county_fips"].str.zfill(5)
@@ -127,6 +119,18 @@ else:
     tbl["county_type"]  = "Unknown"
     tbl["median_income"] = np.nan
 
+# >>> ADDED: fallback income merge (data_work/income_by_fips.csv)
+if INCOME_FILE.exists():
+    inc = pd.read_csv(INCOME_FILE, dtype=str)
+    if {"county_fips","median_income"}.issubset(inc.columns):
+        inc["county_fips"] = inc["county_fips"].astype(str).str.zfill(5)
+        inc["median_income"] = pd.to_numeric(inc["median_income"], errors="coerce")
+        tbl = tbl.merge(inc[["county_fips","median_income"]], on="county_fips", how="left", suffixes=("", "_inc"))
+        if "median_income_inc" in tbl.columns:
+            tbl["median_income"] = tbl["median_income"].combine_first(tbl["median_income_inc"])
+            tbl = tbl.drop(columns=["median_income_inc"])
+
+# default county_type
 tbl["county_type"] = tbl["county_type"].fillna("Unknown")
 
 # hover (name, NPs, ratio, type)
@@ -144,8 +148,10 @@ if tbl["np_density_10k"].notna().any():
     metric_options.append({"label":"NP density (per 10k)","value":"np_density_10k"})
 metric_options.append({"label":"Doctor:NP ratio","value":"doc_np_ratio"})
 
+DEFAULT_FIPS = tbl["county_fips"].iloc[0]
+
 # ---------- figures ----------
-def make_map(df: pd.DataFrame, geojson, metric: str, outlines: bool, title: str | None = None) -> go.Figure:
+def make_map(df: pd.DataFrame, geojson, metric: str, outlines: bool) -> go.Figure:
     plot = df.copy()
     if metric not in plot.columns: plot[metric] = 0
     plot[metric] = pd.to_numeric(plot[metric], errors="coerce").fillna(0)
@@ -163,52 +169,30 @@ def make_map(df: pd.DataFrame, geojson, metric: str, outlines: bool, title: str 
     )
     fig.update_coloraxes(cmin=cmin, cmax=cmax)
     fig.update_geos(fitbounds="locations", visible=False)
-    fig.update_layout(
-        height=560,
-        margin=dict(l=0,r=0,t=40,b=0),
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
-        geo_bgcolor="rgba(0,0,0,0)",
-        title=dict(text=title or "", x=0.02, xanchor="left")
-    )
+    fig.update_layout(height=560, margin=dict(l=0,r=0,t=0,b=0),
+                      paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                      geo_bgcolor="rgba(0,0,0,0)")
     return fig
 
 def make_pie(row: pd.Series) -> go.Figure | None:
+    # works if we have *_pct columns from DEM_FILE or fallback
     needed = ["white_pct","black_pct","asian_pct","aian_pct","nhpi_pct","two_plus_pct","hispanic_pct"]
     if all(k in row.index for k in needed) and pd.notna(row["white_pct"]):
         labels = ["White","Black","Asian","AIAN","NHPI","Two+","Hispanic"]
         vals = [float(row.get(k,0) or 0) for k in needed]
-
-        # Show face-value percentages for both text and hover
-        text_labels = [f"{v:.1f}%" for v in vals]
-        fig = go.Figure(data=[go.Pie(
-            labels=labels,
-            values=vals,
-            hole=0.35,
-            text=text_labels,            # use face-value labels
-            textinfo="text",
-            textposition="outside",
-            customdata=vals,
-            hovertemplate="%{label}: %{customdata:.2f}%<extra></extra>",
-            pull=[0]*len(vals)
-        )])
-        fig.update_layout(
-            margin=dict(l=0,r=0,t=0,b=0),
-            height=320,
-            legend=dict(orientation="h", x=0.5, xanchor="center", y=-0.05)  # a little lower
-        )
+        fig = go.Figure(data=[go.Pie(labels=labels, values=vals, hole=0.35)])
+        fig.update_layout(margin=dict(l=0,r=0,t=0,b=0), height=320, legend=dict(orientation="h"))
         return fig
     return None
 
 # ---------- Dash app ----------
 app = Dash(__name__)
-app.title = "Georgia Nurse Practitioners Dashboard"
-server = app.server
+app.title = "Georgia NP Dashboard"
 
 app.layout = html.Div(
     style={"padding":"16px","fontFamily":"Inter, system-ui, -apple-system, Segoe UI, Roboto, sans-serif"},
     children=[
-        html.H1("Georgia Nurse Practitioners", style={"margin":"0 0 12px 0"}),
+        html.H1("Georgia Nurse Practitioners — Single Map", style={"margin":"0 0 12px 0"}),
 
         html.Div([
             html.Div([
@@ -254,8 +238,7 @@ app.layout = html.Div(
             ], style={"flex":"1","minWidth":"360px"})
         ], style={"display":"flex","gap":"12px"}),
 
-        # start with no selection so details stay hidden until user clicks
-        dcc.Store(id="selected_fips", data=None),
+        dcc.Store(id="selected_fips", data=DEFAULT_FIPS),
     ]
 )
 
@@ -270,8 +253,7 @@ def update_map(metric, type_filter, outlines):
     df = tbl.copy()
     if type_filter and type_filter!="All":
         df = df[df["county_type"].fillna("Unknown")==type_filter]
-    title = metric_title(metric, type_filter)
-    return make_map(df, geo, metric, outlines and ("on" in (outlines or [])), title=title)
+    return make_map(df, geo, metric, outlines and ("on" in outlines))
 
 @app.callback(
     Output("selected_fips","data"),
@@ -297,15 +279,8 @@ def pick_county(clickData, cur):
     Input("selected_fips","data")
 )
 def update_details(fips):
-    if not fips:
-        empty_pie = go.Figure(layout=dict(
-            annotations=[dict(text="Click a county", x=0.5, y=0.5, showarrow=False)],
-            margin=dict(l=0, r=0, t=0, b=0), height=320
-        ))
-        return ("Click a county on the map", "—", "—", "—", "—", "—", "—", empty_pie)
-
     row = tbl.loc[tbl["county_fips"]==fips].squeeze()
-    title   = f"{row['county_name']} "
+    title   = f"{row['county_name']} County ({row['county_fips']})"
     d_np    = f"{int(row['np_count']):,}"
     d_doc   = f"{int(row['doc_count']):,}"
     d_ratio = f"{row['doc_np_ratio']:.2f}" if np.isfinite(row["doc_np_ratio"]) else "N/A"
