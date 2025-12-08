@@ -1,168 +1,141 @@
 # app/app_main.py
+from __future__ import annotations
+import sys
 from pathlib import Path
 import requests
+import numpy as np
 import pandas as pd
-import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
-from streamlit_plotly_events import plotly_events
 
-# -------- paths --------
+# ensure project root on sys.path
 ROOT = Path(__file__).resolve().parents[1]
-NP_FILE    = ROOT / "data_work" / "np_geocoded.csv"
-PHYS_FILE  = ROOT / "data_work" / "phys_geocoded.csv"
-DEMO_FILE  = ROOT / "data_raw"  / "ga_county_demographics.csv"  # optional: population & race %
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-st.set_page_config(page_title="GA Nursing Workforce", layout="wide")
-st.title("Georgia Nursing Workforce — County Dashboard")
+# views
+from app.views.np_map_view import render as render_np
+from app.views.ratio_map_view import render as render_ratio
+from app.views.bivariate_view import render as render_bivar  # optional tab
 
-# -------- helpers --------
-def load_clean(path: Path) -> pd.DataFrame:
-    """Read geocoded CSV, keep only rows mapped to a county, ensure 5-digit FIPS."""
+NP_FILE     = ROOT / "data_work" / "np_geocoded.csv"
+PHYS_FILE   = ROOT / "data_work" / "phys_geocoded.csv"
+DEM_FILE    = ROOT / "data_work" / "demographics.csv"
+INCOME_FILE = ROOT / "data_work" / "income_by_fips.csv"
+
+st.set_page_config(page_title="Georgia NP Dashboard", layout="wide")
+
+@st.cache_data(show_spinner=False)
+def load_ga_geojson():
+    url = "https://raw.githubusercontent.com/plotly/datasets/master/geojson-counties-fips.json"
+    geo = requests.get(url, timeout=30).json()
+    geo["features"] = [f for f in geo.get("features", []) if str(f.get("id","")).startswith("13")]
+    rows = [{"county_fips": str(f["id"]).zfill(5), "county_name": f["properties"].get("NAME","")}
+            for f in geo["features"]]
+    return geo, pd.DataFrame(rows)
+
+@st.cache_data(show_spinner=False)
+def load_points(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path, dtype=str)
     df = df[df["status"].isin(["matched", "zip_fallback"])].copy()
     df["county_fips"] = df["county_fips"].str.zfill(5)
-    return df
+    return df.groupby("county_fips", as_index=False).size().rename(columns={"size": "count"})
 
-def safe_div(num, den):
-    try:
-        num = float(num)
-        den = float(den)
-        return num / den if den > 0 else None
-    except Exception:
-        return None
+@st.cache_data(show_spinner=False)
+def load_optional_csv(path: Path, dtype=None) -> pd.DataFrame:
+    if not Path(path).exists():
+        return pd.DataFrame()
+    return pd.read_csv(path, dtype=dtype)
 
-# -------- 1) Load core data --------
-np_df   = load_clean(NP_FILE)
-phys_df = load_clean(PHYS_FILE)
+def safe_ratio(numer, denom):
+    x = pd.to_numeric(numer, errors="coerce")
+    y = pd.to_numeric(denom, errors="coerce")
+    return pd.Series(np.where((y > 0) & np.isfinite(y), x / y, np.nan))
 
-np_counts = (np_df.groupby("county_fips", as_index=False)
-               .size().rename(columns={"size": "np_count"}))
-phys_counts = (phys_df.groupby("county_fips", as_index=False)
-                 .size().rename(columns={"size": "phys_count"}))
+# --- build master table ---
+geo, names = load_ga_geojson()
+np_counts   = load_points(NP_FILE).rename(columns={"count":"np_count"})
+phys_counts = load_points(PHYS_FILE).rename(columns={"count":"doc_count"})
 
-county = pd.merge(np_counts, phys_counts, on="county_fips", how="outer").fillna(0)
-county["np_count"]   = county["np_count"].astype(int)
-county["phys_count"] = county["phys_count"].astype(int)
-county["doctor_np_ratio"] = county.apply(lambda r: safe_div(r["phys_count"], r["np_count"]), axis=1)
+county_tbl = names.merge(np_counts, on="county_fips", how="left") \
+                  .merge(phys_counts, on="county_fips", how="left")
+county_tbl["np_count"]  = county_tbl["np_count"].fillna(0).astype(int)
+county_tbl["doc_count"] = county_tbl["doc_count"].fillna(0).astype(int)
+county_tbl["doc_np_ratio"] = safe_ratio(county_tbl["doc_count"], county_tbl["np_count"])
 
-# -------- 2) Optional: demographics (population & race %) --------
-has_demo = DEMO_FILE.exists()
-if has_demo:
-    demo = pd.read_csv(DEMO_FILE, dtype={"county_fips": str})
+demo = load_optional_csv(DEM_FILE, dtype=str)
+if not demo.empty:
     demo["county_fips"] = demo["county_fips"].str.zfill(5)
-    # expected columns (use what you have): population, pct_white, pct_black, pct_hispanic
-    # merge whatever exists; missing cols will remain NaN
-    county = county.merge(demo, on="county_fips", how="left")
-
-# If population exists, compute density per 10k; else we’ll use count as fallback
-density_available = has_demo and ("population" in county.columns)
-if density_available:
-    county["np_density_per_10k"] = county.apply(
-        lambda r: safe_div(r["np_count"] * 10000, r["population"]), axis=1
+    for c in ["tot_pop","white_pct","black_pct","asian_pct","aian_pct","nhpi_pct","two_plus_pct","hispanic_pct"]:
+        if c in demo.columns:
+            demo[c] = pd.to_numeric(demo[c], errors="coerce")
+    county_tbl = county_tbl.merge(
+        demo[["county_fips","tot_pop","white_pct","black_pct","asian_pct","aian_pct","nhpi_pct","two_plus_pct","hispanic_pct"]],
+        on="county_fips", how="left"
     )
-
-# -------- 3) GeoJSON for counties (filter to GA) --------
-url = "https://raw.githubusercontent.com/plotly/datasets/master/geojson-counties-fips.json"
-geo = requests.get(url, timeout=30).json()
-geo["features"] = [f for f in geo["features"] if f["id"].startswith("13")]
-
-# build FIPS -> name and attach
-names = pd.DataFrame([{"county_fips": f["id"], "county_name": f["properties"].get("NAME", "")}
-                      for f in geo["features"]])
-county = county.merge(names, on="county_fips", how="left")
-
-# -------- 4) UI controls (top row) --------
-default_metric = "NP Density (per 10k)" if density_available else "NP Count"
-metric = st.selectbox("Map:", [default_metric, "Doctor:NP Ratio"] if density_available
-                               else ["NP Count", "Doctor:NP Ratio"])
-
-left, right = st.columns([3.5, 2.5], gap="large")
-
-# Decide color column + scale per selection
-if metric == "Doctor:NP Ratio":
-    color_col = "doctor_np_ratio"
-    color_scale = "OrRd"
-    labels = {"doctor_np_ratio": "Doctor:NP Ratio", "np_count": "NPs", "phys_count": "Doctors"}
+    county_tbl["np_density_10k"] = np.where(
+        (county_tbl["tot_pop"] > 0) & np.isfinite(county_tbl["tot_pop"]),
+        county_tbl["np_count"]/county_tbl["tot_pop"]*10000.0,
+        np.nan
+    )
 else:
-    if density_available:
-        color_col = "np_density_per_10k"
-        labels = {"np_density_per_10k": "NPs per 10k", "np_count": "NPs"}
+    county_tbl["np_density_10k"] = np.nan
+
+income = load_optional_csv(INCOME_FILE, dtype=str)
+if not income.empty and "median_income" in income.columns:
+    income["county_fips"] = income["county_fips"].str.zfill(5)
+    income["median_income"] = pd.to_numeric(income["median_income"], errors="coerce")
+    county_tbl = county_tbl.merge(income[["county_fips","median_income"]], on="county_fips", how="left")
+
+# --- UI (same layout as your app/app.py) ---
+st.title("Georgia Nurse Practitioners — Two Views")
+
+with st.sidebar:
+    st.header("Controls")
+    show_outlines = st.checkbox("Show county outlines", value=True)
+    if st.button("Clear cache"):
+        st.cache_data.clear()
+        (getattr(st, "rerun", None) or getattr(st, "experimental_rerun", None))()
+
+if "selected_fips" not in st.session_state:
+    st.session_state.selected_fips = county_tbl["county_fips"].iloc[0]
+
+col_maps, col_details = st.columns([2.2, 1.2])
+
+with col_maps:
+    left_metric = "np_density_10k" if county_tbl["np_density_10k"].notna().any() else "np_count"
+    m1, m2 = st.columns(2)
+    with m1:
+        sel1 = render_np(geo=geo, county_tbl=county_tbl, show_outlines=show_outlines, metric=left_metric)
+    with m2:
+        sel2 = render_ratio(geo=geo, county_tbl=county_tbl, show_outlines=show_outlines)
+    if sel1: st.session_state.selected_fips = sel1
+    if sel2: st.session_state.selected_fips = sel2
+
+# (Optional) A third tab for bivariate if you want it back:
+# st.markdown("----")
+# _ = render_bivar(geo=geo, county_tbl=county_tbl, show_outlines=show_outlines)
+
+with col_details:
+    row = county_tbl.loc[county_tbl["county_fips"] == st.session_state.selected_fips].squeeze()
+    st.subheader(f"{row['county_name']} County ({row['county_fips']})")
+    a,b,c = st.columns(3)
+    a.metric("NPs", f"{int(row['np_count']):,}")
+    b.metric("Doctors", f"{int(row['doc_count']):,}")
+    c.metric("Doctor:NP", f"{row['doc_np_ratio']:.2f}" if np.isfinite(row["doc_np_ratio"]) else "N/A")
+    d1, d2 = st.columns(2)
+    dens = f"{row['np_density_10k']:.2f}" if pd.notna(row["np_density_10k"]) else "N/A"
+    d1.caption("NP density (per 10k)"); d1.write(dens)
+    inc  = f"${int(row['median_income']):,}" if ("median_income" in row and pd.notna(row["median_income"])) else "N/A"
+    d2.caption("Median household income"); d2.write(inc)
+
+    st.markdown("### Racial / Ethnic Composition (%)")
+    if ("white_pct" in row) and pd.notna(row["white_pct"]):
+        labels = ["White","Black","Asian","AIAN","NHPI","Two+","Hispanic"]
+        vals = [float(row.get(k,0) or 0) for k in
+                ["white_pct","black_pct","asian_pct","aian_pct","nhpi_pct","two_plus_pct","hispanic_pct"]]
+        fig = go.Figure(data=[go.Pie(labels=labels, values=vals, hole=0.35)])
+        fig.update_layout(margin=dict(l=0,r=0,t=0,b=0), height=300, legend=dict(orientation="h"))
+        st.plotly_chart(fig, use_container_width=True)
     else:
-        color_col = "np_count"
-        labels = {"np_count": "NPs"}
-    color_scale = "Blues"
-
-# -------- 5) Map (left) --------
-with left:
-    # keep just the columns we need for plotting + hover/customdata
-    plot_df = county[["county_fips", "county_name", "np_count", "phys_count",
-                      "doctor_np_ratio"] + ([color_col] if color_col not in
-                                              ["np_count", "phys_count", "doctor_np_ratio"] else [])].copy()
-
-    fig = px.choropleth(
-        plot_df,
-        geojson=geo,
-        locations="county_fips",
-        featureidkey="id",
-        color=color_col,
-        color_continuous_scale=color_scale,
-        hover_name="county_name",
-        hover_data={
-            "county_fips": True,
-            "np_count": True,
-            "phys_count": "Doctor:NP Ratio" != metric,  # keep hover light on the density view
-            "doctor_np_ratio": True,
-        },
-        labels=labels,
-    )
-    fig.update_geos(fitbounds="locations", visible=False)
-    fig.update_layout(margin=dict(l=0, r=0, t=0, b=0))
-
-    # IMPORTANT: attach fips as customdata so we can read it on click
-    fig.update_traces(customdata=plot_df["county_fips"])
-
-    # plot and capture click
-    clicked = plotly_events(fig, click_event=True, hover_event=False,
-                            select_event=False, override_height=620)
-
-# -------- 6) Right panel: KPIs + demographics bar (on click) --------
-with right:
-    st.subheader("County details")
-    selected_fips = None
-    if clicked:
-        # streamlit-plotly-events returns a list of points; grab the first
-        point = clicked[0]
-        # 'customdata' holds our county_fips
-        selected_fips = point.get("customdata")
-
-    if selected_fips is None:
-        st.info("Click a county on the map to view details.")
-    else:
-        row = county.loc[county["county_fips"] == str(selected_fips)]
-        if row.empty:
-            st.warning("No data for that county.")
-        else:
-            r = row.iloc[0]
-            # KPIs
-            k1, k2, k3 = st.columns(3)
-            if density_available:
-                k1.metric("NP Density (per 10k)",
-                          f"{(r['np_density_per_10k'] or 0):.2f}" if pd.notna(r.get("np_density_per_10k")) else "—")
-            else:
-                k1.metric("NP Count", int(r["np_count"]))
-
-            k2.metric("Doctor:NP", f"{(r['doctor_np_ratio'] or 0):.2f}" if pd.notna(r["doctor_np_ratio"]) else "—")
-            k3.metric("NPs", int(r["np_count"]))
-
-            # demographics bar (if available)
-            if has_demo and {"pct_white","pct_black","pct_hispanic"}.issubset(row.columns):
-                bars = pd.DataFrame({
-                    "Group": ["White", "Black", "Hispanic"],
-                    "Percent": [r.get("pct_white"), r.get("pct_black"), r.get("pct_hispanic")]
-                })
-                bars = bars.dropna()
-                if not bars.empty:
-                    st.markdown("**Racial/Ethnic composition (%)**")
-                    st.bar_chart(bars.set_index("Group"))
-            else:
-                st.caption("Add demographics CSV to show race % here (county_fips, pct_white, pct_black, pct_hispanic, population).")
+        st.info("No demographics available for this county.")
