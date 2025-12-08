@@ -1,7 +1,7 @@
 from __future__ import annotations
 import numpy as np
 import pandas as pd
-import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 
 try:
@@ -23,38 +23,57 @@ def _robust_range(s: pd.Series) -> tuple[float, float]:
 
 
 def render(*, geo, county_tbl: pd.DataFrame, show_outlines: bool):
-    plot = county_tbl.copy()
-    cmin, cmax = _robust_range(plot["doc_np_ratio"])
+    df = county_tbl.copy()
+    if "county_name" not in df.columns:
+        df["county_name"] = df.get("county_name_x", df.get("county_name_y", ""))
 
-    fig = px.choropleth(
-        plot,
-        geojson=geo,
-        locations="county_fips",
-        featureidkey="id",
-        color="doc_np_ratio",
-        color_continuous_scale="OrRd",
-        hover_name="county_name",
-        hover_data={"county_fips": False, "np_count": True, "doc_np_ratio": True},
-        labels={"np_count": "NPs", "doc_np_ratio": "Doctor:NP"},
-        title="Doctor:NP ratio (higher = more doctors per NP)",
+    z = pd.to_numeric(df["doc_np_ratio"], errors="coerce")
+    npc = pd.to_numeric(df["np_count"], errors="coerce").fillna(0).astype(int)
+    hover = (
+        df["county_name"].fillna("") +
+        "<br>NPs: " + npc.astype(str) +
+        "<br>Doctor:NP: " + z.round(2).astype(str)
     )
-    fig.update_coloraxes(cmin=cmin, cmax=cmax)
-    fig.update_traces(
+
+    cmin, cmax = _robust_range(z)
+
+    fig = go.Figure(go.Choropleth(
+        geojson=geo,
+        featureidkey="id",
+        locations=df["county_fips"],
+        z=z,
+        colorscale="OrRd",
+        zmin=cmin, zmax=cmax,
         marker_line_width=(0.6 if show_outlines else 0),
         marker_line_color="#777",
+        colorbar_title="Doctor:NP",
+        text=hover,
+        hovertemplate="%{text}<extra></extra>",
+    ))
+
+    fig.update_geos(
+        fitbounds="locations",
+        visible=False,
+        projection_type="mercator",
     )
-    fig.update_geos(fitbounds="locations", visible=False)
-    fig.update_layout(height=430, margin=dict(l=0, r=0, t=36, b=0))
+    fig.update_layout(
+        title="Doctor:NP ratio (higher = more doctors per NP)",
+        height=480,
+        margin=dict(l=0, r=0, t=36, b=0),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        geo_bgcolor="rgba(0,0,0,0)",
+    )
 
     if HAS_EVENTS:
-        ev = plotly_events(fig, click_event=True, hover_event=False, select_event=False, key="ratio_map")
+        ev = plotly_events(fig, click_event=True, hover_event=False, select_event=False, key="ratio_geo")
         if ev:
             loc = ev[0].get("location")
             if loc:
                 return str(loc).zfill(5)
             idx = int(ev[0].get("pointIndex", 0))
-            return plot.iloc[idx]["county_fips"]
+            return df.iloc[idx]["county_fips"]
         return None
     else:
-        st.plotly_chart(fig, use_container_width=True, key="ratio_map")
+        st.plotly_chart(fig, use_container_width=True, key="ratio_geo")
         return None

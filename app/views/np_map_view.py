@@ -1,9 +1,10 @@
 from __future__ import annotations
 import numpy as np
 import pandas as pd
-import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 
+# Optional click-to-select
 try:
     from streamlit_plotly_events import plotly_events
     HAS_EVENTS = True
@@ -22,50 +23,70 @@ def _robust_range(s: pd.Series) -> tuple[float, float]:
     return (max(0.0, lo), hi)
 
 
-def _draw(plot: pd.DataFrame, geo, metric: str, show_outlines: bool, key: str):
-    if metric not in plot.columns:
-        plot = plot.copy()
-        plot[metric] = 0
+def render(*, geo, county_tbl: pd.DataFrame, show_outlines: bool, metric: str = "np_count"):
+    """
+    Classic GA choropleth (no basemap). Returns selected county_fips (or None).
+    metric: "np_count" or "np_density_10k"
+    """
+    df = county_tbl.copy()
 
-    plot[metric] = pd.to_numeric(plot[metric], errors="coerce").fillna(0)
-    cmin, cmax = _robust_range(plot[metric])
+    # Ensure we have a name column
+    if "county_name" not in df.columns:
+        df["county_name"] = df.get("county_name_x", df.get("county_name_y", ""))
 
-    title = "NP density (per 10k)" if metric == "np_density_10k" else "NP count"
+    # numeric Z
+    if metric not in df.columns:
+        df[metric] = 0
+    z = pd.to_numeric(df[metric], errors="coerce").fillna(0)
 
-    fig = px.choropleth(
-        plot,
-        geojson=geo,
-        locations="county_fips",
-        featureidkey="id",
-        color=metric,
-        color_continuous_scale="Blues",
-        hover_name="county_name",
-        hover_data={"county_fips": False, "np_count": True, "doc_np_ratio": True},
-        labels={"np_count": "NPs", "doc_np_ratio": "Doctor:NP"},
-        title=title,
+    # hover text
+    npc = pd.to_numeric(df["np_count"], errors="coerce").fillna(0).astype(int)
+    ratio = pd.to_numeric(df["doc_np_ratio"], errors="coerce")
+    hover = (
+        df["county_name"].fillna("") +
+        "<br>NPs: " + npc.astype(str) +
+        "<br>Doctor:NP: " + ratio.round(2).astype(str)
     )
-    fig.update_coloraxes(cmin=cmin, cmax=cmax)
-    fig.update_traces(
+
+    cmin, cmax = _robust_range(z)
+
+    fig = go.Figure(go.Choropleth(
+        geojson=geo,
+        featureidkey="id",
+        locations=df["county_fips"],
+        z=z,
+        colorscale="Blues",
+        zmin=cmin, zmax=cmax,
         marker_line_width=(0.6 if show_outlines else 0),
         marker_line_color="#777",
+        colorbar_title="NPs" if metric == "np_count" else "NP/10k",
+        text=hover,
+        hovertemplate="%{text}<extra></extra>",
+    ))
+
+    fig.update_geos(
+        fitbounds="locations",
+        visible=False,                 # hide world layers, keep our polygons
+        projection_type="mercator",
     )
-    fig.update_geos(fitbounds="locations", visible=False)
-    fig.update_layout(height=430, margin=dict(l=0, r=0, t=36, b=0))
+    fig.update_layout(
+        title=("NP density (per 10k)" if metric == "np_density_10k" else "NP count"),
+        height=480,
+        margin=dict(l=0, r=0, t=36, b=0),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        geo_bgcolor="rgba(0,0,0,0)",
+    )
 
     if HAS_EVENTS:
-        ev = plotly_events(fig, click_event=True, hover_event=False, select_event=False, key=key)
+        ev = plotly_events(fig, click_event=True, hover_event=False, select_event=False, key=f"np_{metric}_geo")
         if ev:
             loc = ev[0].get("location")
             if loc:
                 return str(loc).zfill(5)
             idx = int(ev[0].get("pointIndex", 0))
-            return plot.iloc[idx]["county_fips"]
+            return df.iloc[idx]["county_fips"]
         return None
     else:
-        st.plotly_chart(fig, use_container_width=True, key=key)
+        st.plotly_chart(fig, use_container_width=True, key=f"np_{metric}_geo")
         return None
-
-
-def render(*, geo, county_tbl: pd.DataFrame, show_outlines: bool, metric: str = "np_count"):
-    """Returns selected county_fips (or None)."""
-    return _draw(county_tbl, geo, metric, show_outlines, key=f"np_{metric}")
