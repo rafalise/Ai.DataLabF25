@@ -188,6 +188,7 @@ def make_pie(row: pd.Series) -> go.Figure | None:
 # ---------- Dash app ----------
 app = Dash(__name__)
 app.title = "Georgia NP Dashboard"
+server = app.server
 
 app.layout = html.Div(
     style={"padding":"16px","fontFamily":"Inter, system-ui, -apple-system, Segoe UI, Roboto, sans-serif"},
