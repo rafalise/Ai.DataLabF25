@@ -318,7 +318,7 @@ def pick_county(clickData, cur):
 )
 def update_details(fips):
     row = tbl.loc[tbl["county_fips"] == fips].squeeze()
-    title   = f"{row['county_name']} County ({row['county_fips']})"
+    title   = f"{row['county_name']} County"
     d_np    = f"{int(row['np_count']):,}"
     d_doc   = f"{int(row['doc_count']):,}"
     d_ratio = f"{row['doc_np_ratio']:.2f}" if np.isfinite(row["doc_np_ratio"]) else "N/A"
